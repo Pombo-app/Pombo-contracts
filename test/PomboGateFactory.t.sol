@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {PomboGate} from "../src/PomboGate.sol";
+import {PomboGateFactory} from "../src/PomboGateFactory.sol";
+import {MockERC20} from "./mocks/Mocks.sol";
+
+contract PomboGateFactoryTest is Test {
+    PomboGateFactory factory;
+    MockERC20 token20;
+    address creatorA = makeAddr("creatorA");
+    address creatorB = makeAddr("creatorB");
+    address alice = makeAddr("alice");
+
+    function setUp() public {
+        factory = new PomboGateFactory();
+        token20 = new MockERC20();
+    }
+
+    function test_createGate_callerBecomesOwner() public {
+        vm.prank(creatorA);
+        address gate = factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        assertEq(PomboGate(gate).owner(), creatorA);
+        assertTrue(PomboGate(gate).everMember(creatorA));
+    }
+
+    function test_createGate_emitsEvent() public {
+        vm.recordLogs();
+        vm.prank(creatorA);
+        address gate = factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        // last log is GateCreated(gate, owner, mode)
+        Vm.Log memory last = logs[logs.length - 1];
+        assertEq(last.topics[0], keccak256("GateCreated(address,address,uint8)"));
+        assertEq(address(uint160(uint256(last.topics[1]))), gate);
+        assertEq(address(uint160(uint256(last.topics[2]))), creatorA);
+    }
+
+    function test_clonesHaveIsolatedState() public {
+        vm.prank(creatorA);
+        PomboGate gateA = PomboGate(factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0));
+        vm.prank(creatorB);
+        PomboGate gateB = PomboGate(factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0));
+
+        vm.prank(creatorA);
+        gateA.allow(alice);
+
+        assertTrue(gateA.checkAccess(alice));
+        assertFalse(gateB.checkAccess(alice));
+        assertFalse(gateB.everMember(alice));
+
+        // creators cannot administer each other's gates
+        vm.prank(creatorA);
+        vm.expectRevert(PomboGate.NotAuthorized.selector);
+        gateB.allow(alice);
+    }
+
+    function test_createGate_invalidParamsBubbleUp() public {
+        vm.prank(creatorA);
+        vm.expectRevert(PomboGate.InvalidParams.selector);
+        factory.createGate(PomboGate.Mode.TOKEN_BALANCE, address(0), 1, 0, 0);
+    }
+
+    function test_eachModeDeploys() public {
+        vm.startPrank(creatorA);
+        factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        factory.createGate(PomboGate.Mode.TOKEN_BALANCE, address(token20), 1e18, 0, 0);
+        factory.createGate(PomboGate.Mode.NFT_OWNERSHIP, address(token20), 0, 0, 0);
+        factory.createGate(PomboGate.Mode.PAID, address(token20), 0, 1e6, 30 days);
+        vm.stopPrank();
+    }
+}

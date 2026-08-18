@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.28"
+optimizer = true
+optimizer_runs = 10000
+# Polygon PoS supports Cancun since the Napoli hardfork
+evm_version = "cancun"
+
+[fuzz]
+runs = 1024
+
+[rpc_endpoints]
+amoy = "https://rpc-amoy.polygon.technology"
+polygon = "https://polygon-bor-rpc.publicnode.com"
