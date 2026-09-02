@@ -25,6 +25,27 @@ contract MockERC20Permit is ERC20Permit {
     }
 }
 
+/// Minimal balanceOf-only token whose balanceOf can be switched to revert —
+/// models a paused token or a proxy upgraded to nothing, after the gate
+/// already validated the interface at initialize.
+contract MockBreakableToken {
+    mapping(address => uint256) private _balances;
+    bool public broken;
+
+    function setBalance(address user, uint256 balance) external {
+        _balances[user] = balance;
+    }
+
+    function setBroken(bool broken_) external {
+        broken = broken_;
+    }
+
+    function balanceOf(address user) external view returns (uint256) {
+        require(!broken, "token broken");
+        return _balances[user];
+    }
+}
+
 contract MockERC721 is ERC721 {
     uint256 private _nextId = 1;
 
