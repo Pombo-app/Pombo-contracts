@@ -185,13 +185,19 @@ contract PomboGate is IERC1271 {
 
     // ---------------------------------------------------------------- ERC-1271
 
-    /// @notice Single gate: valid iff the signer has access right now and, in
-    /// a read-only channel, is the owner or a moderator. Uses the fail-open
-    /// asset check — see _holdsGateAssetSafe.
+    /// @notice Single gate: valid iff the signer has access right now. Uses
+    /// the fail-open asset check — see _holdsGateAssetSafe.
+    ///
+    /// readOnly is deliberately NOT consulted here: this contract only sees a
+    /// hash, never the stream a signature belongs to, so a filter would cut a
+    /// member's reactions, presence and key requests along with the messages.
+    /// The flag is a declaration. Who enforces "members do not post":
+    /// Sealed — key distribution (the content key only goes to owner and
+    /// moderators); Visible — readers at ingest, and the storage node once it
+    /// validates, both of which know the stream and can scope the cut to it.
     function isValidSignature(bytes32 hash, bytes memory signature) external view override returns (bytes4) {
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, signature);
         if (err != ECDSA.RecoverError.NoError || signer == address(0)) return INVALID_SIGNATURE;
-        if (readOnly && signer != owner && !moderators[signer]) return INVALID_SIGNATURE;
         return _hasAccess(signer, true) ? MAGIC_VALUE : INVALID_SIGNATURE;
     }
 

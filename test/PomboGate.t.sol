@@ -390,53 +390,47 @@ contract PomboGateSignatureTest is PomboGateTestBase {
 }
 
 // ---------------------------------------------------------------------------
-// Read-only channels
+// Read-only channels: the flag is a DECLARATION. The contract only sees a
+// hash, never the stream a signature belongs to, so filtering here would cut
+// reactions, presence and key requests along with the messages. Sealed
+// enforces "members do not post" through key distribution; Visible through
+// readers at ingest and, later, the validating storage node.
 // ---------------------------------------------------------------------------
 
 contract PomboGateReadOnlyTest is PomboGateTestBase {
     bytes32 constant HASH = keccak256("streamr envelope payload");
 
-    function test_closed_onlyOwnerAndModeratorsWrite() public {
+    function test_flagDoesNotAffectIsValidSignature() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE, true);
         vm.startPrank(owner);
         gate.allow(alice);
         gate.setModerator(bob, true);
         vm.stopPrank();
 
+        assertTrue(gate.readOnly());
         assertEq(gate.isValidSignature(HASH, sign(ownerPk, HASH)), MAGIC);
         assertEq(gate.isValidSignature(HASH, sign(bobPk, HASH)), MAGIC);
-        // a full member with access still cannot write
+        // a plain member signs valid too: their reactions, presence and key
+        // requests must validate — the message cut lives outside the contract
         assertTrue(gate.checkAccess(alice));
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
-        // strangers stay out too
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        // strangers stay out regardless
         assertEq(gate.isValidSignature(HASH, sign(carolPk, HASH)), INVALID);
     }
 
-    function test_token_holderWithAccessCannotWrite() public {
+    function test_token_holderSignsValid() public {
         PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE, true);
         token20.mint(alice, MIN_BALANCE);
         assertTrue(gate.checkAccess(alice));
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
-        assertEq(gate.isValidSignature(HASH, sign(ownerPk, HASH)), MAGIC);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
     }
 
-    function test_bannedModeratorCannotWrite() public {
+    function test_bannedMemberStaysCut() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE, true);
         vm.startPrank(owner);
         gate.setModerator(bob, true);
         gate.ban(bob);
         vm.stopPrank();
-        assertEq(gate.isValidSignature(HASH, sign(bobPk, HASH)), INVALID);
-    }
-
-    function test_dismissedModeratorCannotWrite() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE, true);
-        vm.startPrank(owner);
-        gate.setModerator(bob, true);
-        gate.setModerator(bob, false);
-        vm.stopPrank();
-        // still an allowlisted member (reads), but no longer a writer
-        assertTrue(gate.checkAccess(bob));
         assertEq(gate.isValidSignature(HASH, sign(bobPk, HASH)), INVALID);
     }
 
@@ -490,7 +484,7 @@ contract PomboGateBrokenTokenTest is PomboGateTestBase {
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
     }
 
-    function test_readOnlyStillFiltersWhileTokenIsBroken() public {
+    function test_readOnlyGateFailsOpenWhileTokenIsBroken() public {
         MockBreakableToken breakable = new MockBreakableToken();
         vm.prank(owner);
         PomboGate gate = PomboGate(
@@ -505,7 +499,9 @@ contract PomboGateBrokenTokenTest is PomboGateTestBase {
             )
         );
         breakable.setBroken(true);
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
+        // the read-only flag is a declaration, not a filter: a broken token
+        // fails open at ingest for everyone, exactly like a non-RO gate
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
         assertEq(gate.isValidSignature(HASH, sign(ownerPk, HASH)), MAGIC);
     }
 
