@@ -4,8 +4,9 @@ pragma solidity 0.8.28;
 import {PomboGate} from "../src/PomboGate.sol";
 import {PomboGateTestBase} from "./PomboGate.t.sol";
 
-/// Moderators (v1.1): owner-appointed, may manage membership, may not erase
-/// history, may not touch the owner or each other, may not mint moderators.
+/// Moderators (v3): owner-appointed, manage the allowlist and publish in
+/// read-only channels; ban/unban is owner-only. They may not touch the owner
+/// or each other and may not appoint moderators.
 contract PomboGateModeratorsTest is PomboGateTestBase {
     PomboGate gate;
     address mod;
@@ -25,19 +26,30 @@ contract PomboGateModeratorsTest is PomboGateTestBase {
         gate.setModerator(alice, true);
     }
 
-    function test_setModerator_grantsMembership() public {
+    function test_setModerator_grantsMembership() public view {
         assertTrue(gate.moderators(mod));
-        assertTrue(gate.everMember(mod));
         assertTrue(gate.allowlist(mod));
         assertTrue(gate.checkAccess(mod));
     }
 
-    function test_setModerator_dismissKeepsMembership() public {
+    function test_setModerator_dismissKeepsAllowlistMembership() public {
         vm.prank(owner);
         gate.setModerator(mod, false);
         assertFalse(gate.moderators(mod));
-        assertTrue(gate.everMember(mod));
         assertTrue(gate.allowlist(mod));
+        assertTrue(gate.checkAccess(mod));
+    }
+
+    function test_setModerator_dismissInTokenModeDropsAccess() public {
+        // no allowlist outside NONE: a dismissed moderator without the asset
+        // is out
+        PomboGate tokenGate = newGate(PomboGate.Mode.TOKEN_BALANCE);
+        vm.startPrank(owner);
+        tokenGate.setModerator(mod, true);
+        assertTrue(tokenGate.checkAccess(mod));
+        tokenGate.setModerator(mod, false);
+        vm.stopPrank();
+        assertFalse(tokenGate.checkAccess(mod));
     }
 
     function test_setModerator_ownerAndZeroRejected() public {
@@ -62,48 +74,34 @@ contract PomboGateModeratorsTest is PomboGateTestBase {
         assertTrue(gate.checkAccess(bob) && gate.checkAccess(carol));
     }
 
-    function test_moderatorCanBanAndUnbanMembers() public {
-        vm.prank(mod);
-        gate.allow(alice);
-        vm.prank(mod);
-        gate.ban(alice, false);
-        assertFalse(gate.checkAccess(alice));
-        // sticky history survives a moderator ban too
-        bytes32 hash = keccak256("payload");
-        assertEq(gate.isValidSignature(hash, sign(alicePk, hash)), MAGIC);
-        vm.prank(mod);
-        gate.unban(alice);
-        assertTrue(gate.checkAccess(alice));
-    }
-
     function test_moderatorCanRevokeAllow() public {
         vm.prank(mod);
         gate.allow(alice);
         vm.prank(mod);
         gate.revokeAllow(alice);
         assertFalse(gate.checkAccess(alice));
-        assertTrue(gate.everMember(alice));
+        assertFalse(gate.allowlist(alice));
     }
 
-    function test_moderatorCannotErase() public {
+    function test_moderatorCannotBanOrUnban() public {
         vm.prank(mod);
         gate.allow(alice);
-        vm.prank(mod);
+        vm.startPrank(mod);
         vm.expectRevert(PomboGate.NotOwner.selector);
-        gate.ban(alice, true);
-        // owner still can
+        gate.ban(alice);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.unban(alice);
+        vm.stopPrank();
+        // the owner can
         vm.prank(owner);
-        gate.ban(alice, true);
-        assertTrue(gate.erased(alice));
+        gate.ban(alice);
+        assertTrue(gate.banned(alice));
     }
 
     function test_moderatorCannotTouchOwner() public {
-        vm.startPrank(mod);
-        vm.expectRevert(PomboGate.InvalidParams.selector);
-        gate.ban(owner, false);
+        vm.prank(mod);
         vm.expectRevert(PomboGate.InvalidParams.selector);
         gate.revokeAllow(owner);
-        vm.stopPrank();
     }
 
     function test_moderatorCannotTouchModerator() public {
@@ -111,19 +109,26 @@ contract PomboGateModeratorsTest is PomboGateTestBase {
         vm.prank(owner);
         gate.setModerator(mod2, true);
 
-        vm.startPrank(mod);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.ban(mod2, false);
+        vm.prank(mod);
         vm.expectRevert(PomboGate.NotAuthorized.selector);
         gate.revokeAllow(mod2);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.unban(mod2);
-        vm.stopPrank();
 
         // the owner can moderate moderators
         vm.prank(owner);
-        gate.ban(mod2, false);
-        assertTrue(gate.banned(mod2));
+        gate.revokeAllow(mod2);
+        assertFalse(gate.allowlist(mod2));
+    }
+
+    function test_moderatorCannotSetPriceOrDuration() public {
+        PomboGate paid = newGate(PomboGate.Mode.PAID);
+        vm.prank(owner);
+        paid.setModerator(mod, true);
+        vm.startPrank(mod);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        paid.setPrice(1);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        paid.setDuration(1);
+        vm.stopPrank();
     }
 
     function test_strangerStillLockedOut() public {
@@ -131,28 +136,26 @@ contract PomboGateModeratorsTest is PomboGateTestBase {
         vm.expectRevert(PomboGate.NotAuthorized.selector);
         gate.allow(bob);
         vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.ban(bob, false);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.unban(bob);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
         gate.revokeAllow(bob);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.ban(bob);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.unban(bob);
         vm.stopPrank();
     }
 
-    function test_bannedModeratorLosesAccessButKeepsHistory() public {
+    function test_bannedModeratorLosesAccessAndWrites() public {
         vm.prank(owner);
-        gate.ban(mod, false);
+        gate.ban(mod);
         assertFalse(gate.checkAccess(mod));
         bytes32 hash = keccak256("payload");
-        assertEq(gate.isValidSignature(hash, sign(modPk, hash)), MAGIC);
+        assertEq(gate.isValidSignature(hash, sign(modPk, hash)), INVALID);
     }
 
     function test_moderatorAccess_tokenModeWithoutHolding() public {
         PomboGate tokenGate = newGate(PomboGate.Mode.TOKEN_BALANCE);
         vm.prank(owner);
         tokenGate.setModerator(mod, true);
-        // a moderator has access without holding the gate asset
         assertTrue(tokenGate.checkAccess(mod));
-        assertTrue(tokenGate.everMember(mod));
     }
 }

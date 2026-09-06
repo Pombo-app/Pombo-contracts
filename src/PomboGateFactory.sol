@@ -19,12 +19,17 @@ contract PomboGateFactory {
         implementation = address(new PomboGate());
     }
 
-    function createGate(PomboGate.Mode mode, address token, uint256 minBalance, uint256 price, uint64 duration)
-        external
-        returns (address gate)
-    {
+    function createGate(
+        PomboGate.Mode mode,
+        address token,
+        uint256 minBalance,
+        uint256 price,
+        uint64 duration,
+        PomboGate.WireIdentity wireIdentity,
+        bool readOnly
+    ) external returns (address gate) {
         gate = Clones.clone(implementation);
-        PomboGate(gate).initialize(msg.sender, mode, token, minBalance, price, duration);
+        PomboGate(gate).initialize(msg.sender, mode, token, minBalance, price, duration, wireIdentity, readOnly);
         emit GateCreated(gate, msg.sender, mode);
     }
 }

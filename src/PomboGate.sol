@@ -8,7 +8,7 @@ import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC2
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-/// @title PomboGate — per-channel access gate with sticky membership (ERC-1271)
+/// @title PomboGate — per-channel access gate (ERC-1271), v3
 ///
 /// One EIP-1167 clone per channel. The clone address is the Streamr publisher
 /// for every member; message authorship is recovered client-side via ecrecover
@@ -17,13 +17,13 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 /// signature must be a standard 65-byte recoverable ECDSA signature over the
 /// raw hash — no EIP-191 prefix, no ZK blobs, no certificate chains.
 ///
-/// Signature validity implements STICKY MEMBERSHIP (high-water mark): leaving,
-/// selling the gate asset or letting a subscription expire NEVER invalidates
-/// messages already published. Write-cut for ex-members happens at the epoch
-/// key layer (checkAccess before answering KEY_REQUEST + kid freshness rule),
-/// not by invalidating signatures. The only thing that makes history disappear
-/// is `erased` — an explicit owner option in the ban flow of Closed (NONE)
-/// channels.
+/// Single gate: isValidSignature answers the same question as checkAccess —
+/// "does this signer have access right now?" — plus the read-only filter.
+/// Selling the gate asset, letting a subscription expire, being revoked or
+/// banned all cut ingest immediately on any vanilla node. Permanence of
+/// already-published messages is a property of storage retention plus the
+/// Pombo read policy (validate at ingest, never revalidate), not of this
+/// contract.
 contract PomboGate is IERC1271 {
     using SafeERC20 for IERC20;
 
@@ -32,6 +32,22 @@ contract PomboGate is IERC1271 {
         TOKEN_BALANCE, // Gated: hold >= minBalance of an ERC-20
         NFT_OWNERSHIP, // Gated: hold >= 1 of an ERC-721
         PAID // Subscription: pay `price` of `token` for `duration` seconds
+    }
+
+    /// Identity on the wire. VISIBLE: every message is signed by its author's
+    /// account. SEALED: everyone publishes under a shared channel key and
+    /// authorship travels sealed inside the envelope.
+    enum WireIdentity {
+        VISIBLE,
+        SEALED
+    }
+
+    struct MemberState {
+        bool access; // checkAccess(user) — strict, reverts on a broken token
+        bool banned;
+        bool moderator;
+        bool allowed; // on the NONE allowlist
+        uint64 paidUntil; // subscription end (PAID), 0 otherwise
     }
 
     bytes4 internal constant MAGIC_VALUE = 0x1626ba7e;
@@ -47,36 +63,46 @@ contract PomboGate is IERC1271 {
     uint256 public price;
     /// Subscription length in seconds (PAID)
     uint64 public duration;
+    /// Immutable after initialize. The contract is the authority on the
+    /// channel's identity mode; the stream-metadata flag is a cached copy.
+    WireIdentity public wireIdentity;
+    /// Immutable after initialize. Only the owner and moderators publish.
+    bool public readOnly;
 
     bool private _initialized;
 
-    /// High-water mark: once true, stays true. Grants signature validity forever.
-    mapping(address => bool) public everMember;
-    /// Cuts future access (checkAccess) but preserves history (isValidSignature).
+    /// Cuts access — and with it signature validity — in every mode.
     mapping(address => bool) public banned;
-    /// The ONLY flag that invalidates published history. Owner-set, NONE mode only.
-    mapping(address => bool) public erased;
-    /// Current members of a NONE (Closed) channel.
-    mapping(address => bool) public allowlist;
     /// Subscription end per member (PAID).
     mapping(address => uint64) public paidUntil;
-    /// Owner-appointed moderators: manage membership (allow/revoke/ban/unban)
-    /// but never erase history, never touch the owner or other moderators,
-    /// and never appoint moderators.
+    /// Owner-appointed moderators: manage the allowlist, publish in read-only
+    /// channels, but never ban, never touch the owner or each other, and
+    /// never appoint moderators.
     mapping(address => bool) public moderators;
 
+    /// Current members of a NONE (Closed) channel, enumerable.
+    address[] private _members;
+    /// 1-based index into _members; 0 means not a member.
+    mapping(address => uint256) private _memberIndex;
+
     event Initialized(
-        address indexed owner, Mode mode, address token, uint256 minBalance, uint256 price, uint64 duration
+        address indexed owner,
+        Mode mode,
+        address token,
+        uint256 minBalance,
+        uint256 price,
+        uint64 duration,
+        WireIdentity wireIdentity,
+        bool readOnly
     );
     event Allowed(address indexed user);
     event AllowRevoked(address indexed user);
-    event MemberJoined(address indexed user);
     event Paid(address indexed user, uint64 paidUntil);
-    event Banned(address indexed user, bool erasedHistory);
+    event Banned(address indexed user);
     event Unbanned(address indexed user);
-    event Unerased(address indexed user);
     event ModeratorSet(address indexed user, bool enabled);
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event PriceSet(uint256 price);
+    event DurationSet(uint64 duration);
 
     error AlreadyInitialized();
     error NotOwner();
@@ -84,9 +110,8 @@ contract PomboGate is IERC1271 {
     error WrongMode();
     error ZeroAddress();
     error InvalidParams();
+    error InvalidToken();
     error IsBanned();
-    error IsErased();
-    error GateNotHeld();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -116,7 +141,9 @@ contract PomboGate is IERC1271 {
         address token_,
         uint256 minBalance_,
         uint256 price_,
-        uint64 duration_
+        uint64 duration_,
+        WireIdentity wireIdentity_,
+        bool readOnly_
     ) external {
         if (_initialized) revert AlreadyInitialized();
         _initialized = true;
@@ -131,6 +158,14 @@ contract PomboGate is IERC1271 {
         } else {
             if (token_ == address(0) || price_ == 0 || duration_ == 0 || minBalance_ != 0) revert InvalidParams();
         }
+        // A wrong token address would create a channel that never works.
+        // Probing address(this) — not address(0), which compliant ERC-721s
+        // MUST revert on — is the one balanceOf query valid on both
+        // interfaces.
+        if (mode_ != Mode.NONE) {
+            (bool ok, bytes memory data) = token_.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
+            if (!ok || data.length < 32) revert InvalidToken();
+        }
 
         owner = owner_;
         mode = mode_;
@@ -138,45 +173,50 @@ contract PomboGate is IERC1271 {
         minBalance = minBalance_;
         price = price_;
         duration = duration_;
+        wireIdentity = wireIdentity_;
+        readOnly = readOnly_;
 
-        // The owner publishes through the clone too (KEY_ANNOUNCE etc.),
-        // so their signatures must validate from block one.
-        everMember[owner_] = true;
         if (mode_ == Mode.NONE) {
-            allowlist[owner_] = true;
+            _addMember(owner_);
         }
 
-        emit Initialized(owner_, mode_, token_, minBalance_, price_, duration_);
+        emit Initialized(owner_, mode_, token_, minBalance_, price_, duration_, wireIdentity_, readOnly_);
     }
 
     // ---------------------------------------------------------------- ERC-1271
 
-    /// @notice Sticky membership: everMember (or currently holding the gate
-    /// asset in TOKEN/NFT modes, since join() is optional there) and not erased.
-    /// `banned` deliberately does NOT invalidate signatures — banning cuts
-    /// future writes at the key layer while preserving the thread.
+    /// @notice Single gate: valid iff the signer has access right now. Uses
+    /// the fail-open asset check — see _holdsGateAssetSafe.
+    ///
+    /// readOnly is deliberately NOT consulted here: this contract only sees a
+    /// hash, never the stream a signature belongs to, so a filter would cut a
+    /// member's reactions, presence and key requests along with the messages.
+    /// The flag is a declaration. Who enforces "members do not post":
+    /// Sealed — key distribution (the content key only goes to owner and
+    /// moderators); Visible — readers at ingest, and the storage node once it
+    /// validates, both of which know the stream and can scope the cut to it.
     function isValidSignature(bytes32 hash, bytes memory signature) external view override returns (bytes4) {
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, signature);
         if (err != ECDSA.RecoverError.NoError || signer == address(0)) return INVALID_SIGNATURE;
-        if (erased[signer]) return INVALID_SIGNATURE;
-        if (everMember[signer]) return MAGIC_VALUE;
-        // join() is optional in TOKEN/NFT modes: a current holder who never
-        // joined is a valid author. If they sell without ever joining, their
-        // history stops validating — permanence is opt-in via join().
-        if (_holdsGateAsset(signer)) return MAGIC_VALUE;
-        return INVALID_SIGNATURE;
+        return _hasAccess(signer, true) ? MAGIC_VALUE : INVALID_SIGNATURE;
     }
 
     // ------------------------------------------------------------------ views
 
-    /// @notice The CURRENT gate — drives key distribution and UI, not history.
+    /// @notice Does this user have access right now? Drives key distribution
+    /// in the clients. Strict: a broken gate token makes this revert, and the
+    /// clients treat that as fail-closed.
     function checkAccess(address user) public view returns (bool) {
+        return _hasAccess(user, false);
+    }
+
+    function _hasAccess(address user, bool failOpen) internal view returns (bool) {
         if (user == owner) return true;
         if (banned[user]) return false;
         if (moderators[user]) return true;
-        if (mode == Mode.NONE) return allowlist[user];
+        if (mode == Mode.NONE) return _memberIndex[user] != 0;
         if (mode == Mode.PAID) return paidUntil[user] > block.timestamp;
-        return _holdsGateAsset(user);
+        return failOpen ? _holdsGateAssetSafe(user) : _holdsGateAsset(user);
     }
 
     /// @notice UI helper: when the user's current access lapses.
@@ -190,10 +230,63 @@ contract PomboGate is IERC1271 {
         return checkAccess(user) ? type(uint64).max : 0;
     }
 
+    /// @notice Batch state read — one call instead of one per field per user.
+    function states(address[] calldata users) external view returns (MemberState[] memory result) {
+        result = new MemberState[](users.length);
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+            result[i] = MemberState({
+                access: _hasAccess(user, false),
+                banned: banned[user],
+                moderator: moderators[user],
+                allowed: _memberIndex[user] != 0,
+                paidUntil: paidUntil[user]
+            });
+        }
+    }
+
+    /// @notice Number of allowlisted members (NONE mode only).
+    function membersCount() external view returns (uint256) {
+        if (mode != Mode.NONE) revert WrongMode();
+        return _members.length;
+    }
+
+    /// @notice Paginated allowlist read (NONE mode only). Order is not stable
+    /// across removals.
+    function membersAt(uint256 offset, uint256 limit) external view returns (address[] memory page) {
+        if (mode != Mode.NONE) revert WrongMode();
+        uint256 len = _members.length;
+        if (offset >= len) return new address[](0);
+        uint256 end = offset + limit;
+        if (end > len) end = len;
+        page = new address[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            page[i - offset] = _members[i];
+        }
+    }
+
+    /// @notice Is this user on the NONE allowlist?
+    function allowlist(address user) external view returns (bool) {
+        return _memberIndex[user] != 0;
+    }
+
+    /// Strict asset check: a revert in the gate token bubbles up. This is the
+    /// path behind checkAccess, and it must NEVER fail open — a broken token
+    /// answering true would hand epoch keys to anyone.
     function _holdsGateAsset(address user) internal view returns (bool) {
         if (mode == Mode.TOKEN_BALANCE) return IERC20(token).balanceOf(user) >= minBalance;
-        if (mode == Mode.NFT_OWNERSHIP) return IERC721(token).balanceOf(user) > 0;
-        return false;
+        return IERC721(token).balanceOf(user) > 0;
+    }
+
+    /// Ingest path only (isValidSignature): a broken gate token must not
+    /// freeze the channel, so a failed balanceOf ACCEPTS the write — the
+    /// worst case is unreadable ciphertext in storage, while a frozen channel
+    /// is unrecoverable. ERC-20 and ERC-721 share the balanceOf selector.
+    function _holdsGateAssetSafe(address user) internal view returns (bool) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (user)));
+        if (!ok || data.length < 32) return true;
+        uint256 balance = abi.decode(data, (uint256));
+        return mode == Mode.TOKEN_BALANCE ? balance >= minBalance : balance > 0;
     }
 
     // ------------------------------------------------------- membership: NONE
@@ -211,31 +304,36 @@ contract PomboGate is IERC1271 {
     function _allow(address user) internal {
         if (mode != Mode.NONE) revert WrongMode();
         if (user == address(0)) revert ZeroAddress();
-        allowlist[user] = true;
-        everMember[user] = true;
+        if (banned[user]) revert IsBanned();
+        _addMember(user);
         emit Allowed(user);
     }
 
-    /// @notice Undo an allow without the ban stigma. everMember stays — allow()
-    /// is a public, owner-signed commitment that this address was a member.
+    /// @notice Undo an allow without the ban stigma.
     function revokeAllow(address user) external onlyOwnerOrModerator {
         if (mode != Mode.NONE) revert WrongMode();
         _requireModerationTarget(user);
-        allowlist[user] = false;
+        _removeMember(user);
         emit AllowRevoked(user);
     }
 
-    // -------------------------------------------------- membership: TOKEN/NFT
+    function _addMember(address user) internal {
+        if (_memberIndex[user] != 0) return;
+        _members.push(user);
+        _memberIndex[user] = _members.length;
+    }
 
-    /// @notice Optional single-tx opt-in to permanence for holder gates.
-    /// Without it, a holder who sells without ever joining loses their history.
-    function join() external {
-        if (mode != Mode.TOKEN_BALANCE && mode != Mode.NFT_OWNERSHIP) revert WrongMode();
-        if (banned[msg.sender]) revert IsBanned();
-        if (erased[msg.sender]) revert IsErased();
-        if (!_holdsGateAsset(msg.sender)) revert GateNotHeld();
-        everMember[msg.sender] = true;
-        emit MemberJoined(msg.sender);
+    function _removeMember(address user) internal {
+        uint256 idx = _memberIndex[user];
+        if (idx == 0) return;
+        uint256 last = _members.length;
+        if (idx != last) {
+            address moved = _members[last - 1];
+            _members[idx - 1] = moved;
+            _memberIndex[moved] = idx;
+        }
+        _members.pop();
+        _memberIndex[user] = 0;
     }
 
     // ------------------------------------------------------- membership: PAID
@@ -247,16 +345,13 @@ contract PomboGate is IERC1271 {
     function pay() public {
         if (mode != Mode.PAID) revert WrongMode();
         if (banned[msg.sender]) revert IsBanned();
-        if (erased[msg.sender]) revert IsErased();
 
         uint64 current = paidUntil[msg.sender];
         uint64 base = current > block.timestamp ? current : uint64(block.timestamp);
         uint64 newUntil = base + duration;
         paidUntil[msg.sender] = newUntil;
-        everMember[msg.sender] = true;
 
         emit Paid(msg.sender, newUntil);
-        emit MemberJoined(msg.sender);
 
         IERC20(token).safeTransferFrom(msg.sender, owner, price);
     }
@@ -270,59 +365,49 @@ contract PomboGate is IERC1271 {
 
     // ------------------------------------------------------------- moderation
 
-    /// @notice Cut future access, preserve history. `eraseHistory` is the one
-    /// exception — available only in NONE (Closed) channels, where removing a
-    /// member IS the ban and the OWNER may explicitly choose to erase their
-    /// messages from the network. Moderators ban, only the owner erases.
-    function ban(address user, bool eraseHistory) external onlyOwnerOrModerator {
-        _requireModerationTarget(user);
+    /// @notice Cut access — and with it ingest — in any mode. Owner only.
+    function ban(address user) external onlyOwner {
+        if (user == owner) revert InvalidParams();
         banned[user] = true;
-        if (eraseHistory) {
-            if (msg.sender != owner) revert NotOwner();
-            if (mode != Mode.NONE) revert WrongMode();
-            erased[user] = true;
-        }
-        emit Banned(user, eraseHistory);
+        emit Banned(user);
     }
 
-    function unban(address user) external onlyOwnerOrModerator {
-        _requireModerationTarget(user);
+    function unban(address user) external onlyOwner {
         banned[user] = false;
         emit Unbanned(user);
     }
 
-    /// @notice Undo an erase — the member's history validates again.
-    function unerase(address user) external onlyOwner {
-        erased[user] = false;
-        emit Unerased(user);
-    }
-
-    /// @notice Appoint or dismiss a moderator (owner only). Appointing also
-    /// makes them a member — a moderator who cannot enter the channel is
-    /// useless — and dismissal leaves membership intact.
+    /// @notice Appoint or dismiss a moderator (owner only). In NONE mode
+    /// appointing also allowlists them, so dismissal leaves membership intact;
+    /// in the other modes a dismissed moderator keeps access only through the
+    /// gate itself.
     function setModerator(address user, bool enabled) external onlyOwner {
         if (user == address(0)) revert ZeroAddress();
         if (user == owner) revert InvalidParams();
         moderators[user] = enabled;
-        if (enabled) {
-            everMember[user] = true;
-            if (mode == Mode.NONE) {
-                allowlist[user] = true;
-            }
+        if (enabled && mode == Mode.NONE) {
+            _addMember(user);
         }
         emit ModeratorSet(user, enabled);
     }
 
-    // -------------------------------------------------------------- ownership
+    // ------------------------------------------------------------- parameters
 
-    function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert ZeroAddress();
-        address previous = owner;
-        owner = newOwner;
-        everMember[newOwner] = true;
-        if (mode == Mode.NONE) {
-            allowlist[newOwner] = true;
-        }
-        emit OwnershipTransferred(previous, newOwner);
+    /// @notice Change the subscription price (PAID only). Affects future
+    /// payments; running subscriptions keep their end date.
+    function setPrice(uint256 price_) external onlyOwner {
+        if (mode != Mode.PAID) revert WrongMode();
+        if (price_ == 0) revert InvalidParams();
+        price = price_;
+        emit PriceSet(price_);
+    }
+
+    /// @notice Change the subscription length (PAID only). Affects future
+    /// payments; running subscriptions keep their end date.
+    function setDuration(uint64 duration_) external onlyOwner {
+        if (mode != Mode.PAID) revert WrongMode();
+        if (duration_ == 0) revert InvalidParams();
+        duration = duration_;
+        emit DurationSet(duration_);
     }
 }

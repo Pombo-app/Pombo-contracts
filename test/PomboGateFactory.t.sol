@@ -5,11 +5,12 @@ import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {PomboGate} from "../src/PomboGate.sol";
 import {PomboGateFactory} from "../src/PomboGateFactory.sol";
-import {MockERC20} from "./mocks/Mocks.sol";
+import {MockERC20, MockERC721} from "./mocks/Mocks.sol";
 
 contract PomboGateFactoryTest is Test {
     PomboGateFactory factory;
     MockERC20 token20;
+    MockERC721 token721;
     address creatorA = makeAddr("creatorA");
     address creatorB = makeAddr("creatorB");
     address alice = makeAddr("alice");
@@ -17,19 +18,23 @@ contract PomboGateFactoryTest is Test {
     function setUp() public {
         factory = new PomboGateFactory();
         token20 = new MockERC20();
+        token721 = new MockERC721();
+    }
+
+    function createClosed(address creator) internal returns (address) {
+        vm.prank(creator);
+        return factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
     }
 
     function test_createGate_callerBecomesOwner() public {
-        vm.prank(creatorA);
-        address gate = factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        address gate = createClosed(creatorA);
         assertEq(PomboGate(gate).owner(), creatorA);
-        assertTrue(PomboGate(gate).everMember(creatorA));
+        assertTrue(PomboGate(gate).checkAccess(creatorA));
     }
 
     function test_createGate_emitsEvent() public {
         vm.recordLogs();
-        vm.prank(creatorA);
-        address gate = factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        address gate = createClosed(creatorA);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         // last log is GateCreated(gate, owner, mode)
         Vm.Log memory last = logs[logs.length - 1];
@@ -39,17 +44,15 @@ contract PomboGateFactoryTest is Test {
     }
 
     function test_clonesHaveIsolatedState() public {
-        vm.prank(creatorA);
-        PomboGate gateA = PomboGate(factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0));
-        vm.prank(creatorB);
-        PomboGate gateB = PomboGate(factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0));
+        PomboGate gateA = PomboGate(createClosed(creatorA));
+        PomboGate gateB = PomboGate(createClosed(creatorB));
 
         vm.prank(creatorA);
         gateA.allow(alice);
 
         assertTrue(gateA.checkAccess(alice));
         assertFalse(gateB.checkAccess(alice));
-        assertFalse(gateB.everMember(alice));
+        assertFalse(gateB.allowlist(alice));
 
         // creators cannot administer each other's gates
         vm.prank(creatorA);
@@ -60,15 +63,25 @@ contract PomboGateFactoryTest is Test {
     function test_createGate_invalidParamsBubbleUp() public {
         vm.prank(creatorA);
         vm.expectRevert(PomboGate.InvalidParams.selector);
-        factory.createGate(PomboGate.Mode.TOKEN_BALANCE, address(0), 1, 0, 0);
+        factory.createGate(PomboGate.Mode.TOKEN_BALANCE, address(0), 1, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
+    }
+
+    function test_createGate_invalidTokenBubblesUp() public {
+        vm.prank(creatorA);
+        vm.expectRevert(PomboGate.InvalidToken.selector);
+        factory.createGate(PomboGate.Mode.TOKEN_BALANCE, alice, 1, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
     }
 
     function test_eachModeDeploys() public {
         vm.startPrank(creatorA);
-        factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0);
-        factory.createGate(PomboGate.Mode.TOKEN_BALANCE, address(token20), 1e18, 0, 0);
-        factory.createGate(PomboGate.Mode.NFT_OWNERSHIP, address(token20), 0, 0, 0);
-        factory.createGate(PomboGate.Mode.PAID, address(token20), 0, 1e6, 30 days);
+        factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
+        factory.createGate(
+            PomboGate.Mode.TOKEN_BALANCE, address(token20), 1e18, 0, 0, PomboGate.WireIdentity.SEALED, false
+        );
+        factory.createGate(
+            PomboGate.Mode.NFT_OWNERSHIP, address(token721), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, true
+        );
+        factory.createGate(PomboGate.Mode.PAID, address(token20), 0, 1e6, 30 days, PomboGate.WireIdentity.SEALED, true);
         vm.stopPrank();
     }
 }

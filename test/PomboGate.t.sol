@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {PomboGate} from "../src/PomboGate.sol";
 import {PomboGateFactory} from "../src/PomboGateFactory.sol";
-import {MockERC20, MockERC20Permit, MockERC721} from "./mocks/Mocks.sol";
+import {MockERC20, MockERC20Permit, MockERC721, MockBreakableToken} from "./mocks/Mocks.sol";
 
 contract PomboGateTestBase is Test {
     bytes4 constant MAGIC = 0x1626ba7e;
@@ -45,17 +45,36 @@ contract PomboGateTestBase is Test {
     }
 
     function newGate(PomboGate.Mode mode) internal returns (PomboGate) {
+        return newGate(mode, false);
+    }
+
+    function newGate(PomboGate.Mode mode, bool readOnly) internal returns (PomboGate) {
         vm.prank(owner);
         if (mode == PomboGate.Mode.NONE) {
-            return PomboGate(factory.createGate(mode, address(0), 0, 0, 0));
+            return PomboGate(factory.createGate(mode, address(0), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, readOnly));
         }
         if (mode == PomboGate.Mode.TOKEN_BALANCE) {
-            return PomboGate(factory.createGate(mode, address(token20), MIN_BALANCE, 0, 0));
+            return PomboGate(
+                factory.createGate(mode, address(token20), MIN_BALANCE, 0, 0, PomboGate.WireIdentity.VISIBLE, readOnly)
+            );
         }
         if (mode == PomboGate.Mode.NFT_OWNERSHIP) {
-            return PomboGate(factory.createGate(mode, address(token721), 0, 0, 0));
+            return
+                PomboGate(
+                    factory.createGate(mode, address(token721), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, readOnly)
+                );
         }
-        return PomboGate(factory.createGate(mode, address(tokenPermit), 0, PRICE, DURATION));
+        return PomboGate(
+            factory.createGate(mode, address(tokenPermit), 0, PRICE, DURATION, PomboGate.WireIdentity.VISIBLE, readOnly)
+        );
+    }
+
+    /// Gate on a token whose balanceOf can be flipped to revert after creation.
+    function newBreakableGate(PomboGate.Mode mode) internal returns (PomboGate gate, MockBreakableToken breakable) {
+        breakable = new MockBreakableToken();
+        uint256 min = mode == PomboGate.Mode.TOKEN_BALANCE ? MIN_BALANCE : 0;
+        vm.prank(owner);
+        gate = PomboGate(factory.createGate(mode, address(breakable), min, 0, 0, PomboGate.WireIdentity.VISIBLE, false));
     }
 
     /// Bare clone that skipped the constructor — initialize is still open,
@@ -65,16 +84,17 @@ contract PomboGateTestBase is Test {
     }
 
     /// Standard 65-byte recoverable ECDSA signature over the raw hash —
-    /// exactly what the Streamr SDK hands to isValidSignature (§3.11).
+    /// exactly what the Streamr SDK hands to isValidSignature.
     function sign(uint256 pk, bytes32 hash) internal pure returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, hash);
         return abi.encodePacked(r, s, v);
     }
 
     function fundAndPay(PomboGate gate, address user) internal {
-        tokenPermit.mint(user, PRICE);
+        uint256 amount = gate.price();
+        tokenPermit.mint(user, amount);
         vm.startPrank(user);
-        tokenPermit.approve(address(gate), PRICE);
+        tokenPermit.approve(address(gate), amount);
         gate.pay();
         vm.stopPrank();
     }
@@ -88,19 +108,53 @@ contract PomboGateInitTest is PomboGateTestBase {
     function test_implementationIsLocked() public {
         PomboGate impl = PomboGate(factory.implementation());
         vm.expectRevert(PomboGate.AlreadyInitialized.selector);
-        impl.initialize(owner, PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        impl.initialize(owner, PomboGate.Mode.NONE, address(0), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
     }
 
     function test_cloneCannotBeInitializedTwice() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.expectRevert(PomboGate.AlreadyInitialized.selector);
-        gate.initialize(alice, PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        gate.initialize(alice, PomboGate.Mode.NONE, address(0), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
     }
 
     function test_zeroOwnerReverts() public {
         PomboGate g = newUninitializedClone();
         vm.expectRevert(PomboGate.ZeroAddress.selector);
-        g.initialize(address(0), PomboGate.Mode.NONE, address(0), 0, 0, 0);
+        g.initialize(address(0), PomboGate.Mode.NONE, address(0), 0, 0, 0, PomboGate.WireIdentity.VISIBLE, false);
+    }
+
+    function test_ownerHasAccessInAllModes() public {
+        assertTrue(newGate(PomboGate.Mode.NONE).checkAccess(owner));
+        assertTrue(newGate(PomboGate.Mode.TOKEN_BALANCE).checkAccess(owner));
+        assertTrue(newGate(PomboGate.Mode.NFT_OWNERSHIP).checkAccess(owner));
+        assertTrue(newGate(PomboGate.Mode.PAID).checkAccess(owner));
+    }
+
+    function test_noneMode_ownerIsAllowlisted() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        assertTrue(gate.allowlist(owner));
+        assertEq(gate.membersCount(), 1);
+        assertEq(gate.membersAt(0, 10)[0], owner);
+    }
+
+    function test_paramsStored() public {
+        PomboGate gate = newGate(PomboGate.Mode.PAID);
+        assertEq(gate.owner(), owner);
+        assertEq(uint8(gate.mode()), uint8(PomboGate.Mode.PAID));
+        assertEq(gate.token(), address(tokenPermit));
+        assertEq(gate.price(), PRICE);
+        assertEq(gate.duration(), DURATION);
+        assertEq(uint8(gate.wireIdentity()), uint8(PomboGate.WireIdentity.VISIBLE));
+        assertFalse(gate.readOnly());
+    }
+
+    function test_wireIdentitySealedAndReadOnlyStored() public {
+        vm.prank(owner);
+        PomboGate gate = PomboGate(
+            factory.createGate(PomboGate.Mode.NONE, address(0), 0, 0, 0, PomboGate.WireIdentity.SEALED, true)
+        );
+        assertEq(uint8(gate.wireIdentity()), uint8(PomboGate.WireIdentity.SEALED));
+        assertTrue(gate.readOnly());
     }
 
     /// expectRevert arms on the NEXT external call, so the clone must exist
@@ -114,28 +168,7 @@ contract PomboGateInitTest is PomboGateTestBase {
         uint64 duration_
     ) internal {
         vm.expectRevert(PomboGate.InvalidParams.selector);
-        g.initialize(owner, mode_, token_, minBalance_, price_, duration_);
-    }
-
-    function test_ownerIsEverMemberInAllModes() public {
-        assertTrue(newGate(PomboGate.Mode.NONE).everMember(owner));
-        assertTrue(newGate(PomboGate.Mode.TOKEN_BALANCE).everMember(owner));
-        assertTrue(newGate(PomboGate.Mode.NFT_OWNERSHIP).everMember(owner));
-        assertTrue(newGate(PomboGate.Mode.PAID).everMember(owner));
-    }
-
-    function test_noneMode_ownerIsAllowlisted() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        assertTrue(gate.allowlist(owner));
-    }
-
-    function test_paramsStored() public {
-        PomboGate gate = newGate(PomboGate.Mode.PAID);
-        assertEq(gate.owner(), owner);
-        assertEq(uint8(gate.mode()), uint8(PomboGate.Mode.PAID));
-        assertEq(gate.token(), address(tokenPermit));
-        assertEq(gate.price(), PRICE);
-        assertEq(gate.duration(), DURATION);
+        g.initialize(owner, mode_, token_, minBalance_, price_, duration_, PomboGate.WireIdentity.VISIBLE, false);
     }
 
     function test_invalidParams_none() public {
@@ -162,10 +195,45 @@ contract PomboGateInitTest is PomboGateTestBase {
         expectInvalidParams(newUninitializedClone(), PomboGate.Mode.PAID, address(tokenPermit), 0, PRICE, 0);
         expectInvalidParams(newUninitializedClone(), PomboGate.Mode.PAID, address(tokenPermit), 1, PRICE, DURATION);
     }
+
+    function test_tokenWithoutBalanceOfReverts() public {
+        // the factory has code but no balanceOf — the call reverts
+        PomboGate g = newUninitializedClone();
+        vm.expectRevert(PomboGate.InvalidToken.selector);
+        g.initialize(
+            owner,
+            PomboGate.Mode.TOKEN_BALANCE,
+            address(factory),
+            MIN_BALANCE,
+            0,
+            0,
+            PomboGate.WireIdentity.VISIBLE,
+            false
+        );
+    }
+
+    function test_eoaAsTokenReverts() public {
+        // a codeless address answers the staticcall with empty data
+        PomboGate g = newUninitializedClone();
+        vm.expectRevert(PomboGate.InvalidToken.selector);
+        g.initialize(
+            owner, PomboGate.Mode.TOKEN_BALANCE, alice, MIN_BALANCE, 0, 0, PomboGate.WireIdentity.VISIBLE, false
+        );
+        PomboGate g2 = newUninitializedClone();
+        vm.expectRevert(PomboGate.InvalidToken.selector);
+        g2.initialize(owner, PomboGate.Mode.PAID, alice, 0, PRICE, DURATION, PomboGate.WireIdentity.VISIBLE, false);
+    }
+
+    function test_compliantErc721Initializes() public {
+        // ERC-721 balanceOf(address(0)) MUST revert per the standard, so the
+        // interface probe must not use the zero address
+        PomboGate gate = newGate(PomboGate.Mode.NFT_OWNERSHIP);
+        assertEq(gate.token(), address(token721));
+    }
 }
 
 // ---------------------------------------------------------------------------
-// isValidSignature — sticky membership
+// isValidSignature — single gate: write access cut the moment access lapses
 // ---------------------------------------------------------------------------
 
 contract PomboGateSignatureTest is PomboGateTestBase {
@@ -188,46 +256,38 @@ contract PomboGateSignatureTest is PomboGateTestBase {
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
     }
 
-    function test_sticky_revokeAllowKeepsHistoryValid() public {
+    function test_closed_revokeAllowCutsWrites() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.startPrank(owner);
         gate.allow(alice);
         gate.revokeAllow(alice);
         vm.stopPrank();
         assertFalse(gate.checkAccess(alice));
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
-    }
-
-    function test_sticky_banKeepsHistoryValid() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.startPrank(owner);
-        gate.allow(alice);
-        gate.ban(alice, false);
-        vm.stopPrank();
-        assertFalse(gate.checkAccess(alice));
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
-    }
-
-    function test_erasedInvalidatesHistory() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.startPrank(owner);
-        gate.allow(alice);
-        gate.ban(alice, true);
-        vm.stopPrank();
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
     }
 
-    function test_uneraseRestoresHistory() public {
+    function test_closed_banCutsWrites() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.startPrank(owner);
         gate.allow(alice);
-        gate.ban(alice, true);
-        gate.unerase(alice);
+        gate.ban(alice);
         vm.stopPrank();
+        assertFalse(gate.checkAccess(alice));
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
+    }
+
+    function test_closed_unbanRestoresWrites() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.ban(alice);
+        gate.unban(alice);
+        vm.stopPrank();
+        // the allowlist entry survived the ban, so access and writes are back
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
     }
 
-    function test_token_holderWithoutJoinIsValid() public {
+    function test_token_holderIsValid() public {
         PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
         token20.mint(alice, MIN_BALANCE);
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
@@ -239,67 +299,70 @@ contract PomboGateSignatureTest is PomboGateTestBase {
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
     }
 
-    function test_token_sellWithoutJoinLosesHistory() public {
+    function test_token_sellingCutsWrites() public {
         PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
         token20.mint(alice, MIN_BALANCE);
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
-        token20.burn(alice, MIN_BALANCE);
+        vm.prank(alice);
+        assertTrue(token20.transfer(bob, 1));
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
     }
 
-    function test_token_sticky_joinThenSellKeepsHistory() public {
-        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
-        token20.mint(alice, MIN_BALANCE);
-        vm.prank(alice);
-        gate.join();
-        token20.burn(alice, MIN_BALANCE);
-        assertFalse(gate.checkAccess(alice));
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
-    }
-
-    function test_token_bannedHolderStillValidatesHistory() public {
-        // Ban cuts writes at the key layer; signatures — history — survive.
+    function test_token_bannedHolderCannotWrite() public {
         PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
         token20.mint(alice, MIN_BALANCE);
         vm.prank(owner);
-        gate.ban(alice, false);
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        gate.ban(alice);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
         assertFalse(gate.checkAccess(alice));
     }
 
-    function test_nft_holderWithoutJoinIsValid() public {
+    function test_nft_holderIsValid() public {
         PomboGate gate = newGate(PomboGate.Mode.NFT_OWNERSHIP);
         token721.mint(alice);
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
     }
 
-    function test_nft_sticky_joinThenSellKeepsHistory() public {
+    function test_nft_sellingCutsWrites() public {
         PomboGate gate = newGate(PomboGate.Mode.NFT_OWNERSHIP);
         uint256 id = token721.mint(alice);
-        vm.prank(alice);
-        gate.join();
-        token721.burn(id);
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
-    }
-
-    function test_nft_sellWithoutJoinLosesHistory() public {
-        PomboGate gate = newGate(PomboGate.Mode.NFT_OWNERSHIP);
-        uint256 id = token721.mint(alice);
         token721.burn(id);
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
     }
 
-    function test_paid_sticky_expiryKeepsHistoryValid() public {
+    function test_paid_subscriberIsValid() public {
+        PomboGate gate = newGate(PomboGate.Mode.PAID);
+        fundAndPay(gate, alice);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+    }
+
+    function test_paid_expiryCutsWrites() public {
         PomboGate gate = newGate(PomboGate.Mode.PAID);
         fundAndPay(gate, alice);
         vm.warp(block.timestamp + DURATION + 1);
         assertFalse(gate.checkAccess(alice));
-        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
     }
 
     function test_paid_neverPaidIsInvalid() public {
         PomboGate gate = newGate(PomboGate.Mode.PAID);
         assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
+    }
+
+    function test_paid_bannedSubscriberCannotWrite() public {
+        PomboGate gate = newGate(PomboGate.Mode.PAID);
+        fundAndPay(gate, alice);
+        vm.prank(owner);
+        gate.ban(alice);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
+    }
+
+    function test_moderatorWritesWithoutHolding() public {
+        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
+        vm.prank(owner);
+        gate.setModerator(alice, true);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
     }
 
     function test_malformedSignatureReturnsInvalid_noRevert() public {
@@ -327,7 +390,141 @@ contract PomboGateSignatureTest is PomboGateTestBase {
 }
 
 // ---------------------------------------------------------------------------
-// checkAccess / accessUntil — the CURRENT gate
+// Read-only channels: the flag is a DECLARATION. The contract only sees a
+// hash, never the stream a signature belongs to, so filtering here would cut
+// reactions, presence and key requests along with the messages. Sealed
+// enforces "members do not post" through key distribution; Visible through
+// readers at ingest and, later, the validating storage node.
+// ---------------------------------------------------------------------------
+
+contract PomboGateReadOnlyTest is PomboGateTestBase {
+    bytes32 constant HASH = keccak256("streamr envelope payload");
+
+    function test_flagDoesNotAffectIsValidSignature() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE, true);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.setModerator(bob, true);
+        vm.stopPrank();
+
+        assertTrue(gate.readOnly());
+        assertEq(gate.isValidSignature(HASH, sign(ownerPk, HASH)), MAGIC);
+        assertEq(gate.isValidSignature(HASH, sign(bobPk, HASH)), MAGIC);
+        // a plain member signs valid too: their reactions, presence and key
+        // requests must validate — the message cut lives outside the contract
+        assertTrue(gate.checkAccess(alice));
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        // strangers stay out regardless
+        assertEq(gate.isValidSignature(HASH, sign(carolPk, HASH)), INVALID);
+    }
+
+    function test_token_holderSignsValid() public {
+        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE, true);
+        token20.mint(alice, MIN_BALANCE);
+        assertTrue(gate.checkAccess(alice));
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+    }
+
+    function test_bannedMemberStaysCut() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE, true);
+        vm.startPrank(owner);
+        gate.setModerator(bob, true);
+        gate.ban(bob);
+        vm.stopPrank();
+        assertEq(gate.isValidSignature(HASH, sign(bobPk, HASH)), INVALID);
+    }
+
+    function test_readOnlyDoesNotAffectCheckAccess() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE, true);
+        vm.prank(owner);
+        gate.allow(alice);
+        // reading — key distribution — is untouched by the read-only flag
+        assertTrue(gate.checkAccess(alice));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broken gate token: fail-open at ingest, strict for key distribution
+// ---------------------------------------------------------------------------
+
+contract PomboGateBrokenTokenTest is PomboGateTestBase {
+    bytes32 constant HASH = keccak256("streamr envelope payload");
+
+    function test_token_ingestFailsOpen_checkAccessReverts() public {
+        (PomboGate gate, MockBreakableToken breakable) = newBreakableGate(PomboGate.Mode.TOKEN_BALANCE);
+        breakable.setBalance(alice, MIN_BALANCE);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        assertTrue(gate.checkAccess(alice));
+
+        breakable.setBroken(true);
+        // ingest accepts the write — a broken token must not freeze the channel
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        assertEq(gate.isValidSignature(HASH, sign(bobPk, HASH)), MAGIC);
+        // but key distribution must NOT open up: checkAccess reverts and the
+        // clients fail closed
+        vm.expectRevert();
+        gate.checkAccess(alice);
+        vm.expectRevert();
+        gate.checkAccess(bob);
+    }
+
+    function test_nft_ingestFailsOpen_checkAccessReverts() public {
+        (PomboGate gate, MockBreakableToken breakable) = newBreakableGate(PomboGate.Mode.NFT_OWNERSHIP);
+        breakable.setBroken(true);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        vm.expectRevert();
+        gate.checkAccess(alice);
+    }
+
+    function test_banStillCutsWritesWhileTokenIsBroken() public {
+        (PomboGate gate, MockBreakableToken breakable) = newBreakableGate(PomboGate.Mode.TOKEN_BALANCE);
+        vm.prank(owner);
+        gate.ban(alice);
+        breakable.setBroken(true);
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), INVALID);
+    }
+
+    function test_readOnlyGateFailsOpenWhileTokenIsBroken() public {
+        MockBreakableToken breakable = new MockBreakableToken();
+        vm.prank(owner);
+        PomboGate gate = PomboGate(
+            factory.createGate(
+                PomboGate.Mode.TOKEN_BALANCE,
+                address(breakable),
+                MIN_BALANCE,
+                0,
+                0,
+                PomboGate.WireIdentity.VISIBLE,
+                true
+            )
+        );
+        breakable.setBroken(true);
+        // the read-only flag is a declaration, not a filter: a broken token
+        // fails open at ingest for everyone, exactly like a non-RO gate
+        assertEq(gate.isValidSignature(HASH, sign(alicePk, HASH)), MAGIC);
+        assertEq(gate.isValidSignature(HASH, sign(ownerPk, HASH)), MAGIC);
+    }
+
+    function test_statesRevertsWhileTokenIsBroken() public {
+        (PomboGate gate, MockBreakableToken breakable) = newBreakableGate(PomboGate.Mode.TOKEN_BALANCE);
+        breakable.setBroken(true);
+        address[] memory users = new address[](1);
+        users[0] = alice;
+        vm.expectRevert();
+        gate.states(users);
+    }
+
+    function test_ownerUnaffectedByBrokenToken() public {
+        (PomboGate gate, MockBreakableToken breakable) = newBreakableGate(PomboGate.Mode.TOKEN_BALANCE);
+        breakable.setBroken(true);
+        // owner short-circuits before the asset check on both paths
+        assertTrue(gate.checkAccess(owner));
+        assertEq(gate.isValidSignature(HASH, sign(ownerPk, HASH)), MAGIC);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// checkAccess / accessUntil — the live gate
 // ---------------------------------------------------------------------------
 
 contract PomboGateAccessTest is PomboGateTestBase {
@@ -346,7 +543,7 @@ contract PomboGateAccessTest is PomboGateTestBase {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.startPrank(owner);
         gate.allow(alice);
-        gate.ban(alice, false);
+        gate.ban(alice);
         vm.stopPrank();
         assertFalse(gate.checkAccess(alice));
         vm.prank(owner);
@@ -368,15 +565,7 @@ contract PomboGateAccessTest is PomboGateTestBase {
         token20.mint(alice, MIN_BALANCE);
         assertTrue(gate.checkAccess(alice));
         vm.prank(alice);
-        token20.transfer(bob, 1);
-        assertFalse(gate.checkAccess(alice));
-    }
-
-    function test_token_bannedHolderHasNoAccess() public {
-        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
-        token20.mint(alice, MIN_BALANCE);
-        vm.prank(owner);
-        gate.ban(alice, false);
+        assertTrue(token20.transfer(bob, 1));
         assertFalse(gate.checkAccess(alice));
     }
 
@@ -400,21 +589,13 @@ contract PomboGateAccessTest is PomboGateTestBase {
         assertFalse(gate.checkAccess(alice));
     }
 
-    function test_ownerAlwaysHasAccess_everyMode() public {
-        // Owner never holds tokens, never pays — access regardless
-        assertTrue(newGate(PomboGate.Mode.NONE).checkAccess(owner));
-        assertTrue(newGate(PomboGate.Mode.TOKEN_BALANCE).checkAccess(owner));
-        assertTrue(newGate(PomboGate.Mode.NFT_OWNERSHIP).checkAccess(owner));
-        assertTrue(newGate(PomboGate.Mode.PAID).checkAccess(owner));
-    }
-
     function test_accessUntil_paid() public {
         PomboGate gate = newGate(PomboGate.Mode.PAID);
         assertEq(gate.accessUntil(alice), 0);
         fundAndPay(gate, alice);
         assertEq(gate.accessUntil(alice), uint64(block.timestamp) + DURATION);
         vm.prank(owner);
-        gate.ban(alice, false);
+        gate.ban(alice);
         assertEq(gate.accessUntil(alice), 0);
         assertEq(gate.accessUntil(owner), type(uint64).max);
     }
@@ -424,6 +605,138 @@ contract PomboGateAccessTest is PomboGateTestBase {
         assertEq(gate.accessUntil(alice), 0);
         token20.mint(alice, MIN_BALANCE);
         assertEq(gate.accessUntil(alice), type(uint64).max);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// states — batch state read
+// ---------------------------------------------------------------------------
+
+contract PomboGateStatesTest is PomboGateTestBase {
+    function test_states_closedChannel() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.allow(bob);
+        gate.ban(bob);
+        gate.setModerator(carol, true);
+        vm.stopPrank();
+
+        address[] memory users = new address[](5);
+        users[0] = owner;
+        users[1] = alice;
+        users[2] = bob;
+        users[3] = carol;
+        users[4] = makeAddr("stranger");
+        PomboGate.MemberState[] memory result = gate.states(users);
+
+        assertTrue(result[0].access);
+        assertTrue(result[0].allowed);
+        assertTrue(result[1].access && result[1].allowed && !result[1].banned && !result[1].moderator);
+        assertTrue(!result[2].access && result[2].allowed && result[2].banned);
+        assertTrue(result[3].access && result[3].moderator && result[3].allowed);
+        assertTrue(!result[4].access && !result[4].allowed && !result[4].banned && !result[4].moderator);
+    }
+
+    function test_states_paidChannel() public {
+        PomboGate gate = newGate(PomboGate.Mode.PAID);
+        fundAndPay(gate, alice);
+        address[] memory users = new address[](2);
+        users[0] = alice;
+        users[1] = bob;
+        PomboGate.MemberState[] memory result = gate.states(users);
+        assertTrue(result[0].access);
+        assertEq(result[0].paidUntil, uint64(block.timestamp) + DURATION);
+        assertTrue(!result[1].access);
+        assertEq(result[1].paidUntil, 0);
+    }
+
+    function test_states_emptyInput() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        assertEq(gate.states(new address[](0)).length, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Member enumeration (NONE mode)
+// ---------------------------------------------------------------------------
+
+contract PomboGateEnumerationTest is PomboGateTestBase {
+    function test_countAndPagination() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.allow(bob);
+        gate.allow(carol);
+        vm.stopPrank();
+
+        assertEq(gate.membersCount(), 4); // owner + 3
+
+        address[] memory all = gate.membersAt(0, 10);
+        assertEq(all.length, 4);
+        assertEq(all[0], owner);
+        assertEq(all[1], alice);
+        assertEq(all[2], bob);
+        assertEq(all[3], carol);
+
+        address[] memory page = gate.membersAt(1, 2);
+        assertEq(page.length, 2);
+        assertEq(page[0], alice);
+        assertEq(page[1], bob);
+
+        assertEq(gate.membersAt(4, 10).length, 0);
+        assertEq(gate.membersAt(100, 10).length, 0);
+    }
+
+    function test_allowIsIdempotent() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.allow(alice);
+        vm.stopPrank();
+        assertEq(gate.membersCount(), 2);
+    }
+
+    function test_revokeRemovesFromEnumeration() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.allow(bob);
+        gate.revokeAllow(alice); // swap-and-pop: bob moves into alice's slot
+        vm.stopPrank();
+
+        assertEq(gate.membersCount(), 2);
+        address[] memory all = gate.membersAt(0, 10);
+        assertEq(all[0], owner);
+        assertEq(all[1], bob);
+        assertFalse(gate.allowlist(alice));
+        assertTrue(gate.allowlist(bob));
+    }
+
+    function test_revokeNonMemberIsNoop() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.prank(owner);
+        gate.revokeAllow(alice);
+        assertEq(gate.membersCount(), 1);
+    }
+
+    function test_banDoesNotRemoveFromEnumeration() public {
+        // the loss-of-access sweep needs banned members as candidates too
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.allow(alice);
+        gate.ban(alice);
+        vm.stopPrank();
+        assertEq(gate.membersCount(), 2);
+        assertTrue(gate.allowlist(alice));
+    }
+
+    function test_wrongModeReverts() public {
+        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
+        vm.expectRevert(PomboGate.WrongMode.selector);
+        gate.membersCount();
+        vm.expectRevert(PomboGate.WrongMode.selector);
+        gate.membersAt(0, 10);
     }
 }
 
@@ -453,6 +766,19 @@ contract PomboGateMembershipTest is PomboGateTestBase {
         gate.allow(address(0));
     }
 
+    function test_allow_bannedReverts() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.ban(alice);
+        vm.expectRevert(PomboGate.IsBanned.selector);
+        gate.allow(alice);
+        // re-admitting takes an explicit unban first
+        gate.unban(alice);
+        gate.allow(alice);
+        vm.stopPrank();
+        assertTrue(gate.checkAccess(alice));
+    }
+
     function test_allowBatch() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         address[] memory users = new address[](3);
@@ -462,67 +788,23 @@ contract PomboGateMembershipTest is PomboGateTestBase {
         vm.prank(owner);
         gate.allowBatch(users);
         assertTrue(gate.checkAccess(alice) && gate.checkAccess(bob) && gate.checkAccess(carol));
-        assertTrue(gate.everMember(alice) && gate.everMember(bob) && gate.everMember(carol));
     }
 
-    function test_join_setsEverMember() public {
-        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
-        token20.mint(alice, MIN_BALANCE);
-        vm.prank(alice);
-        vm.expectEmit(true, false, false, false);
-        emit PomboGate.MemberJoined(alice);
-        gate.join();
-        assertTrue(gate.everMember(alice));
-    }
-
-    function test_join_nonHolderReverts() public {
-        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
-        vm.prank(alice);
-        vm.expectRevert(PomboGate.GateNotHeld.selector);
-        gate.join();
-    }
-
-    function test_join_belowMinReverts() public {
-        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
-        token20.mint(alice, MIN_BALANCE - 1);
-        vm.prank(alice);
-        vm.expectRevert(PomboGate.GateNotHeld.selector);
-        gate.join();
-    }
-
-    function test_join_nft() public {
-        PomboGate gate = newGate(PomboGate.Mode.NFT_OWNERSHIP);
-        token721.mint(alice);
-        vm.prank(alice);
-        gate.join();
-        assertTrue(gate.everMember(alice));
-    }
-
-    function test_join_wrongModeReverts() public {
-        PomboGate none = newGate(PomboGate.Mode.NONE);
-        vm.prank(alice);
-        vm.expectRevert(PomboGate.WrongMode.selector);
-        none.join();
-
-        PomboGate paid = newGate(PomboGate.Mode.PAID);
-        vm.prank(alice);
-        vm.expectRevert(PomboGate.WrongMode.selector);
-        paid.join();
-    }
-
-    function test_join_bannedHolderReverts() public {
-        PomboGate gate = newGate(PomboGate.Mode.TOKEN_BALANCE);
-        token20.mint(alice, MIN_BALANCE);
-        vm.prank(owner);
-        gate.ban(alice, false);
-        vm.prank(alice);
+    function test_allowBatch_bannedEntryRevertsWholeBatch() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        gate.ban(bob);
+        address[] memory users = new address[](2);
+        users[0] = alice;
+        users[1] = bob;
         vm.expectRevert(PomboGate.IsBanned.selector);
-        gate.join();
+        gate.allowBatch(users);
+        vm.stopPrank();
     }
 }
 
 // ---------------------------------------------------------------------------
-// PAID: pay / payWithPermit
+// PAID: pay / payWithPermit / setPrice / setDuration
 // ---------------------------------------------------------------------------
 
 contract PomboGatePayTest is PomboGateTestBase {
@@ -539,10 +821,9 @@ contract PomboGatePayTest is PomboGateTestBase {
         assertEq(tokenPermit.balanceOf(alice), 0);
     }
 
-    function test_pay_setsPaidUntilAndEverMember() public {
+    function test_pay_setsPaidUntil() public {
         fundAndPay(gate, alice);
         assertEq(gate.paidUntil(alice), uint64(block.timestamp) + DURATION);
-        assertTrue(gate.everMember(alice));
         assertTrue(gate.checkAccess(alice));
     }
 
@@ -579,7 +860,7 @@ contract PomboGatePayTest is PomboGateTestBase {
 
     function test_pay_bannedReverts() public {
         vm.prank(owner);
-        gate.ban(alice, false);
+        gate.ban(alice);
         tokenPermit.mint(alice, PRICE);
         vm.startPrank(alice);
         tokenPermit.approve(address(gate), PRICE);
@@ -593,6 +874,60 @@ contract PomboGatePayTest is PomboGateTestBase {
         vm.prank(alice);
         vm.expectRevert(PomboGate.WrongMode.selector);
         none.pay();
+    }
+
+    function test_setPrice_appliesToNextPayment() public {
+        vm.prank(owner);
+        gate.setPrice(PRICE * 2);
+        assertEq(gate.price(), PRICE * 2);
+        fundAndPay(gate, alice);
+        assertEq(tokenPermit.balanceOf(owner), PRICE * 2);
+    }
+
+    function test_setDuration_appliesToNextPayment() public {
+        vm.prank(owner);
+        gate.setDuration(7 days);
+        fundAndPay(gate, alice);
+        assertEq(gate.paidUntil(alice), uint64(block.timestamp) + 7 days);
+    }
+
+    function test_setPriceDuration_runningSubscriptionKeepsEnd() public {
+        fundAndPay(gate, alice);
+        uint64 end = gate.paidUntil(alice);
+        vm.startPrank(owner);
+        gate.setPrice(PRICE * 10);
+        gate.setDuration(1 days);
+        vm.stopPrank();
+        assertEq(gate.paidUntil(alice), end);
+        assertTrue(gate.checkAccess(alice));
+    }
+
+    function test_setPriceDuration_onlyOwner() public {
+        vm.startPrank(alice);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.setPrice(1);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.setDuration(1);
+        vm.stopPrank();
+    }
+
+    function test_setPriceDuration_zeroReverts() public {
+        vm.startPrank(owner);
+        vm.expectRevert(PomboGate.InvalidParams.selector);
+        gate.setPrice(0);
+        vm.expectRevert(PomboGate.InvalidParams.selector);
+        gate.setDuration(0);
+        vm.stopPrank();
+    }
+
+    function test_setPriceDuration_wrongModeReverts() public {
+        PomboGate none = newGate(PomboGate.Mode.NONE);
+        vm.startPrank(owner);
+        vm.expectRevert(PomboGate.WrongMode.selector);
+        none.setPrice(1);
+        vm.expectRevert(PomboGate.WrongMode.selector);
+        none.setDuration(1);
+        vm.stopPrank();
     }
 
     function _permitSig(uint256 pk, address permitOwner, uint256 value, uint256 deadline)
@@ -639,109 +974,48 @@ contract PomboGatePayTest is PomboGateTestBase {
 }
 
 // ---------------------------------------------------------------------------
-// Moderation: ban / unban / erase
+// Moderation: ban / unban (owner only)
 // ---------------------------------------------------------------------------
 
 contract PomboGateModerationTest is PomboGateTestBase {
-    function test_ban_onlyOwnerOrModerator() public {
+    function test_ban_onlyOwner() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.prank(alice);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.ban(bob, false);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.ban(bob);
+    }
+
+    function test_unban_onlyOwner() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        vm.prank(alice);
+        vm.expectRevert(PomboGate.NotOwner.selector);
+        gate.unban(bob);
     }
 
     function test_ban_ownerCannotBanSelf() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.prank(owner);
         vm.expectRevert(PomboGate.InvalidParams.selector);
-        gate.ban(owner, false);
+        gate.ban(owner);
     }
 
-    function test_ban_eraseOnlyInClosedChannels() public {
-        PomboGate token = newGate(PomboGate.Mode.TOKEN_BALANCE);
+    function test_ban_emitsEvent() public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.prank(owner);
-        vm.expectRevert(PomboGate.WrongMode.selector);
-        token.ban(alice, true);
-
-        PomboGate paid = newGate(PomboGate.Mode.PAID);
-        vm.prank(owner);
-        vm.expectRevert(PomboGate.WrongMode.selector);
-        paid.ban(alice, true);
-
-        PomboGate nft = newGate(PomboGate.Mode.NFT_OWNERSHIP);
-        vm.prank(owner);
-        vm.expectRevert(PomboGate.WrongMode.selector);
-        nft.ban(alice, true);
+        vm.expectEmit(true, false, false, false);
+        emit PomboGate.Banned(alice);
+        gate.ban(alice);
+        assertTrue(gate.banned(alice));
     }
 
-    function test_ban_withErase_setsBothFlags() public {
+    function test_ownerCanBanModerator() public {
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         vm.startPrank(owner);
-        gate.allow(alice);
-        vm.expectEmit(true, false, false, true);
-        emit PomboGate.Banned(alice, true);
-        gate.ban(alice, true);
+        gate.setModerator(bob, true);
+        gate.ban(bob);
         vm.stopPrank();
-        assertTrue(gate.banned(alice));
-        assertTrue(gate.erased(alice));
-    }
-
-    function test_ban_withoutErase_leavesErasedFalse() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.prank(owner);
-        gate.ban(alice, false);
-        assertTrue(gate.banned(alice));
-        assertFalse(gate.erased(alice));
-    }
-
-    function test_unban_unerase_strangerRejected() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.startPrank(alice);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.unban(bob);
-        // unerase stays owner-only — it resurrects erased history
-        vm.expectRevert(PomboGate.NotOwner.selector);
-        gate.unerase(bob);
-        vm.stopPrank();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Ownership
-// ---------------------------------------------------------------------------
-
-contract PomboGateOwnershipTest is PomboGateTestBase {
-    function test_transferOwnership() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.prank(owner);
-        gate.transferOwnership(alice);
-        assertEq(gate.owner(), alice);
-        assertTrue(gate.everMember(alice));
-        assertTrue(gate.allowlist(alice));
-
-        // old owner lost admin powers (and was never a moderator)
-        vm.prank(owner);
-        vm.expectRevert(PomboGate.NotAuthorized.selector);
-        gate.allow(bob);
-
-        // new owner has them
-        vm.prank(alice);
-        gate.allow(bob);
-        assertTrue(gate.checkAccess(bob));
-    }
-
-    function test_transferOwnership_zeroReverts() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.prank(owner);
-        vm.expectRevert(PomboGate.ZeroAddress.selector);
-        gate.transferOwnership(address(0));
-    }
-
-    function test_transferOwnership_onlyOwner() public {
-        PomboGate gate = newGate(PomboGate.Mode.NONE);
-        vm.prank(alice);
-        vm.expectRevert(PomboGate.NotOwner.selector);
-        gate.transferOwnership(alice);
+        assertTrue(gate.banned(bob));
+        assertFalse(gate.checkAccess(bob));
     }
 }
 
@@ -750,7 +1024,7 @@ contract PomboGateOwnershipTest is PomboGateTestBase {
 // ---------------------------------------------------------------------------
 
 contract PomboGateFuzzTest is PomboGateTestBase {
-    function testFuzz_onlySignaturesFromMembersValidate(uint256 pk, bytes32 hash) public {
+    function testFuzz_signatureValidityTracksAccess(uint256 pk, bytes32 hash) public {
         pk = bound(pk, 1, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140);
         PomboGate gate = newGate(PomboGate.Mode.NONE);
         address signer = vm.addr(pk);
@@ -761,17 +1035,17 @@ contract PomboGateFuzzTest is PomboGateTestBase {
             assertEq(gate.isValidSignature(hash, sig), INVALID);
         }
 
-        // after allow: always valid, regardless of hash
+        // after allow: valid, regardless of hash
         vm.prank(owner);
         gate.allow(signer);
         assertEq(gate.isValidSignature(hash, sig), MAGIC);
 
-        // sticky under revoke + ban
-        vm.startPrank(owner);
+        // revoking cuts writes immediately
+        vm.prank(owner);
         gate.revokeAllow(signer);
-        if (signer != owner) gate.ban(signer, false);
-        vm.stopPrank();
-        assertEq(gate.isValidSignature(hash, sig), MAGIC);
+        if (signer != owner) {
+            assertEq(gate.isValidSignature(hash, sig), INVALID);
+        }
     }
 
     function testFuzz_tokenGateTracksBalanceExactly(uint256 balance) public {
@@ -780,6 +1054,7 @@ contract PomboGateFuzzTest is PomboGateTestBase {
         token20.mint(alice, balance);
         assertEq(gate.checkAccess(alice), balance >= MIN_BALANCE);
         bytes32 hash = keccak256("payload");
+        // single gate: ingest and key distribution agree while the token responds
         assertEq(gate.isValidSignature(hash, sign(alicePk, hash)), balance >= MIN_BALANCE ? MAGIC : INVALID);
     }
 
@@ -801,5 +1076,38 @@ contract PomboGateFuzzTest is PomboGateTestBase {
         bytes4 result = gate.isValidSignature(keccak256("h"), garbage);
         // Either invalid, or (vanishingly unlikely) a valid sig of a member
         assertTrue(result == INVALID || result == MAGIC);
+    }
+
+    function testFuzz_enumerationStaysConsistent(uint8 addCount, uint8 removeMask) public {
+        PomboGate gate = newGate(PomboGate.Mode.NONE);
+        addCount = uint8(bound(addCount, 0, 8));
+        address[] memory users = new address[](addCount);
+        vm.startPrank(owner);
+        for (uint256 i = 0; i < addCount; i++) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            users[i] = address(uint160(0x1000 + i));
+            gate.allow(users[i]);
+        }
+        uint256 expected = 1 + addCount; // owner + added
+        for (uint256 i = 0; i < addCount; i++) {
+            if ((removeMask >> i) & 1 != 0) {
+                gate.revokeAllow(users[i]);
+                expected--;
+            }
+        }
+        vm.stopPrank();
+
+        assertEq(gate.membersCount(), expected);
+        address[] memory all = gate.membersAt(0, 20);
+        assertEq(all.length, expected);
+        for (uint256 i = 0; i < addCount; i++) {
+            bool kept = (removeMask >> i) & 1 == 0;
+            assertEq(gate.allowlist(users[i]), kept);
+            bool found = false;
+            for (uint256 j = 0; j < all.length; j++) {
+                if (all[j] == users[i]) found = true;
+            }
+            assertEq(found, kept);
+        }
     }
 }
